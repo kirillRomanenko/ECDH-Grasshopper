@@ -64,15 +64,14 @@ std::vector<unsigned char> generate_iv() {
     return iv;
 }
 
-std::vector<unsigned char> encrypt_kuznyechik_ctr(const std::vector<unsigned char>& plaintext,
+std::vector<unsigned char> encrypt_kuznyechik_cbc(const std::vector<unsigned char>& plaintext,
                                                const std::vector<unsigned char>& key,
-                                               std::vector<unsigned char>& iv,
-                                               size_t& block_count) {
+                                               const std::vector<unsigned char>& iv) {
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) handle_openssl_error();
     
-    // Устанавливаем алгоритм Кузнечик (GOST R 34.12-2015) в режиме CTR
-    EVP_CIPHER* cipher = EVP_CIPHER_fetch(nullptr, "kuznyechik-ctr", nullptr);
+    // Устанавливаем алгоритм Кузнечик в режиме CBC
+    EVP_CIPHER* cipher = EVP_CIPHER_fetch(nullptr, "kuznyechik-cbc", nullptr);
     if (!cipher) {
         EVP_CIPHER_CTX_free(ctx);
         handle_openssl_error();
@@ -84,16 +83,27 @@ std::vector<unsigned char> encrypt_kuznyechik_ctr(const std::vector<unsigned cha
         handle_openssl_error();
     }
     
-    int ciphertext_len = plaintext.size() + EVP_CIPHER_get_block_size(cipher);
-    std::vector<unsigned char> ciphertext(ciphertext_len);
+    // Выравнивание данных по размеру блока (PKCS7 padding)
+    size_t padded_len = plaintext.size() + (BLOCK_SIZE - (plaintext.size() % BLOCK_SIZE));
+    std::vector<unsigned char> padded_plaintext(padded_len);
+    memcpy(padded_plaintext.data(), plaintext.data(), plaintext.size());
     
+    // Добавляем padding
+    unsigned char pad_value = padded_len - plaintext.size();
+    for (size_t i = plaintext.size(); i < padded_len; ++i) {
+        padded_plaintext[i] = pad_value;
+    }
+    
+    // Буфер для шифротекста (может быть больше из-за padding)
+    std::vector<unsigned char> ciphertext(padded_len + BLOCK_SIZE);
     int len;
-    if (EVP_EncryptUpdate(ctx, ciphertext.data(), &len, plaintext.data(), plaintext.size()) <= 0) {
+    
+    if (EVP_EncryptUpdate(ctx, ciphertext.data(), &len, padded_plaintext.data(), padded_len) <= 0) {
         EVP_CIPHER_free(cipher);
         EVP_CIPHER_CTX_free(ctx);
         handle_openssl_error();
     }
-    ciphertext_len = len;
+    int ciphertext_len = len;
     
     if (EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len) <= 0) {
         EVP_CIPHER_free(cipher);
@@ -102,8 +112,6 @@ std::vector<unsigned char> encrypt_kuznyechik_ctr(const std::vector<unsigned cha
     }
     ciphertext_len += len;
     ciphertext.resize(ciphertext_len);
-    
-    block_count = (plaintext.size() + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
     EVP_CIPHER_CTX_free(ctx);
     EVP_CIPHER_free(cipher);
@@ -136,7 +144,6 @@ int main(int argc, char* argv[]) {
         
         // Проверка и подготовка ключа
         if (alice_secret.size() < KEY_SIZE) {
-            // Хешируем секрет, если он слишком короткий
             EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
             EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr);
             EVP_DigestUpdate(mdctx, alice_secret.data(), alice_secret.size());
@@ -144,7 +151,6 @@ int main(int argc, char* argv[]) {
             EVP_DigestFinal_ex(mdctx, alice_secret.data(), nullptr);
             EVP_MD_CTX_free(mdctx);
         } else if (alice_secret.size() > KEY_SIZE) {
-            // Обрезаем, если слишком длинный
             alice_secret.resize(KEY_SIZE);
         }
         
@@ -165,11 +171,13 @@ int main(int argc, char* argv[]) {
         
         std::vector<unsigned char> iv = generate_iv();
         
-        std::cout << "Encrypting with Kuznyechik (GOST R 34.12-2015) in CTR mode...\n";
-        size_t block_count = 0;
+        std::cout << "Encrypting with Kuznyechik (GOST R 34.12-2015) in CBC mode...\n";
         auto encrypt_start = std::chrono::high_resolution_clock::now();
-        std::vector<unsigned char> ciphertext = encrypt_kuznyechik_ctr(file_data, alice_secret, iv, block_count);
+        std::vector<unsigned char> ciphertext = encrypt_kuznyechik_cbc(file_data, alice_secret, iv);
         auto encrypt_end = std::chrono::high_resolution_clock::now();
+        
+        // Расчет количества блоков
+        size_t block_count = (file_data.size() + BLOCK_SIZE - 1) / BLOCK_SIZE;
         
         auto end = std::chrono::high_resolution_clock::now();
         auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -186,6 +194,7 @@ int main(int argc, char* argv[]) {
                   << " MB/s\n";
         std::cout << "========================================\n";
         
+        // Сохранение зашифрованных данных и IV
         std::ofstream out_file("encrypted.bin", std::ios::binary);
         out_file.write(reinterpret_cast<char*>(iv.data()), iv.size());
         out_file.write(reinterpret_cast<char*>(ciphertext.data()), ciphertext.size());
